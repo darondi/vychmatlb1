@@ -1,4 +1,4 @@
-﻿#include <glut.h>
+#include <glut.h>
 #include <SDL.h>
 #undef main
 #include <SDL_opengl.h>
@@ -33,6 +33,78 @@ void rabinovich_fabrikant(double* x, double* fx, void* params) {
     fx[0] = x[1] * (x[2] - 1 + x[0] * x[0]) + gamma * x[0];
     fx[1] = x[0] * (3 * x[2] + 1 - x[0] * x[0]) + gamma * x[1];
     fx[2] = -2 * x[2] * (alpha + x[0] * x[1]);
+}
+
+void rkf12_step(int n, double* x0, double* xh1, double* xh2, double h,
+    void (*f)(double* x, double* fx, void* params), void* params,
+    double tolerance, double& next_h) {
+    // Используем векторы для коэффициентов
+    std::vector<double> c = { 0.0, 0.5, 1.0 };
+    std::vector<std::vector<double>> a = {
+        {0.0,      0.0,      0.0},
+        {0.5,      0.0,      0.0},
+        {1.0 / 256.0, 255.0 / 256.0, 0.0}
+    };
+    std::vector<double> b1 = { 1.0 / 512.0, 255.0 / 256.0, 1.0 / 512.0 }; // Первый порядок
+    std::vector<double> b2 = { 1.0 / 256.0, 255.0 / 256.0, 0.0 };        // Второй порядок
+
+    // Выделение памяти для промежуточных значений
+    double* k1 = (double*)malloc(sizeof(double) * n);
+    double* k2 = (double*)malloc(sizeof(double) * n);
+    double* k3 = (double*)malloc(sizeof(double) * n);
+
+    if (!k1 || !k2 || !k3) {
+        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        free(k1); free(k2); free(k3);
+        next_h = -1.0; // Указываем неудачный шаг
+        return;
+    }
+
+    // Вычисление промежуточных значений k1-k3
+    f(x0, k1, params); // k1 = f(x0)
+
+    double* x_temp = (double*)malloc(sizeof(double) * n);
+    for (int i = 0; i < n; i++) {
+        x_temp[i] = x0[i] + h * a[1][0] * k1[i];
+    }
+    f(x_temp, k2, params); // k2 = f(x_temp)
+
+    for (int i = 0; i < n; i++) {
+        x_temp[i] = x0[i] + h * (a[2][0] * k1[i] + a[2][1] * k2[i]);
+    }
+    f(x_temp, k3, params); // k3 = f(x_temp)
+
+    // Освобождение временной памяти
+    free(x_temp);
+
+    // Вычисление решений первого и второго порядков
+    for (int i = 0; i < n; i++) {
+        xh1[i] = x0[i] + h * (b1[0] * k1[i] + b1[1] * k2[i] + b1[2] * k3[i]);
+        xh2[i] = x0[i] + h * (b2[0] * k1[i] + b2[1] * k2[i] + b2[2] * k3[i]);
+    }
+
+    // Оценка ошибки как норма разности между xh1 и xh2
+    double max_error = 0.0;
+    for (int i = 0; i < n; i++) {
+        double local_error = std::fabs(xh1[i] - xh2[i]);
+        if (local_error > max_error) {
+            max_error = local_error;
+        }
+    }
+
+    // Коррекция шага
+    const double safety_factor = 0.9;
+    if (max_error <= tolerance) {
+        next_h = safety_factor * h * std::pow(tolerance / max_error, 1.0 / 2.0);
+    }
+    else {
+        next_h = -1.0; // Специальное значение для неудачного шага
+    }
+
+    // Освобождение выделенной памяти
+    free(k1);
+    free(k2);
+    free(k3);
 }
 
 // Метод Эйлера
@@ -234,8 +306,10 @@ void adaptive_runge_kutta_step(int n, double* x0, double* xh, double& h,
     for (int i = 0; i < n; i++) {
         xh[i] = x0[i] + h * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]) / 6.0;
     }
+    // xh1 and xh2 реализовать 
 
-    double half_h = h / 2.0;
+
+    /*double half_h = h / 2.0;
     f(x0, k1, params);
     for (int i = 0; i < n; i++) tmp[i] = x0[i] + half_h * k1[i] / 2.0;
     f(tmp, k2, params);
@@ -256,7 +330,7 @@ void adaptive_runge_kutta_step(int n, double* x0, double* xh, double& h,
     for (int i = 0; i < n; i++) {
         x_half[i] += half_h * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]) / 6.0;
     }
-
+    */
     double error = 0.0;
     for (int i = 0; i < n; i++) {
         error = fmax(error, fabs(xh[i] - x_half[i]));
@@ -421,7 +495,8 @@ void solve_newton(double* x_next, double* x_guess, double h,
     double** J = (double**)malloc(sizeof(double*) * n);
     double* delta_x = (double*)malloc(sizeof(double) * n);
     double* b = (double*)malloc(sizeof(double) * n);
-    if (!fx || !J || !delta_x || !b) {
+    double* x0 = (double*)malloc(sizeof(double) * n);
+    if (!fx || !J || !delta_x || !b || !x0) {
         fprintf(stderr, "Ошибка: Не удалось выделить память\n");
         exit(1);
     }
@@ -431,11 +506,13 @@ void solve_newton(double* x_next, double* x_guess, double h,
             fprintf(stderr, "Ошибка: Не удалось выделить память\n");
             exit(1);
         }
+        x0[i] = x_guess[i]; // Сохраняем начальное приближение
     }
+
     for (int iter = 0; iter < max_iterations; ++iter) {
         f(x_guess, fx, params);
         for (int i = 0; i < n; ++i) {
-            b[i] = x_guess[i] - x_guess[i] - h * fx[i]; // F(x_guess) = x_guess - x0 - h * f(x_guess), x0 = x_guess
+            b[i] = x_guess[i] - x0[i] - h * fx[i]; // F(x_guess) = x_guess - x0 - h * f(x_guess), x0 = x_guess
         }
         numerical_jacobian(x_guess, J, f, params, n, h_numerical);
         for (int i = 0; i < n; i++) {
@@ -559,24 +636,24 @@ void write_to_file(const char* filename, double t, int step_count, double x, dou
 }
 
 Uint32 callback(Uint32 interval, void* name) {
-    static double dt = 0.01;
+    static double dt = 0.001;
     static int step_count = 0;
     static int max_steps = 20000;
     double newstate[3];
     static double prev_state[3];
     static double prev_state2[3];
     static double t = 0.0;
-    static double t_max = 60.0;
+    static double t_max = 80.0;
 
     //runge_kutta_callback(dt, state); //0.01
     //dormand_prince_callback(dt, state); // 0.01
     //euler_callback(dt, state); // 0.003
     //adaptive_runge_kutta_callback(dt, state); // 0.01
     //predictor_corrector_callback(dt, state, prev_state, prev_state2, step_count);
-    //implicit_euler_step_callback(dt, state); // только 0.001
+    implicit_euler_step_callback(dt, state); // только 0.001
     //adams_multon_callback(dt, state, prev_state, prev_state2, step_count); // 0.003 либо 0.005
     
-    //write_to_file("dp8_01.txt", t, step_count, state[0], state[1], state[2]);
+    write_to_file("new_impl_euler.txt", t, step_count, state[0], state[1], state[2]);
     
     t += dt;
     step_count++;
